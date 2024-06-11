@@ -1,11 +1,21 @@
 #!/bin/bash
+#   --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
+#   --image_folder ./playground/data/LLaVA-Pretrain/images \
+#   --deepspeed ./scripts/zero2.json \
+#   --model_name_or_path lmsys/vicuna-13b-v1.5 \
+#   --output_dir ./checkpoints/llava-v1.5-13b-pretrain \
 
-deepspeed llava/train/train_mem.py \
-    --deepspeed ./scripts/zero2.json \
+
+MASTER_PORT=29501
+#export CUDA_VISIBLE_DEVICES=4,5,6,7
+#deepspeed llava/train/train_mem.py \
+#deepspeed --master_port $MASTER_PORT --include localhost:0,1,2,3 llava/train/train_xformers.py \
+deepspeed --master_port $MASTER_PORT llava/train/train_mem.py \
+    --deepspeed ./scripts/zero3.json \
     --model_name_or_path lmsys/vicuna-13b-v1.5 \
     --version plain \
-    --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
-    --image_folder ./playground/data/LLaVA-Pretrain/images \
+    --image_folder  ../../../raid/work/zha437/playground/data/LLaVA-Pretrain/images \
+    --data_path ../../../raid/work/zha437/playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
