@@ -14,8 +14,8 @@ deepspeed --master_port $MASTER_PORT llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path lmsys/vicuna-13b-v1.5 \
     --version plain \
-    --image_folder  ../playground/data/LLaVA-Pretrain/images \
-    --data_path ../playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
+    --image_folder  ../../playground/data/LLaVA-Pretrain/images \
+    --data_path ../../playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
