@@ -942,6 +942,10 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+    # print("**************")
+    # print(model_args.vision_tower)
+    # print(model.get_model().mm_projector)
+    # exit()
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

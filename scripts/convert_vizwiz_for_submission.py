@@ -1,7 +1,8 @@
 import os
 import argparse
 import json
-
+import sys
+sys.path.append('/datasets/work/d61-insect-digitisation/work/Experiments/zha437/zha437/LLaVA')
 from llava.eval.m4c_evaluator import EvalAIAnswerProcessor
 
 
