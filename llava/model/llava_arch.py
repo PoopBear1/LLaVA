@@ -13,13 +13,62 @@
 #    limitations under the License.
 
 
+# in pretrian.sh settings:
+'''LlavaConfig = {
+  "_name_or_path": "lmsys/vicuna-13b-v1.5",
+  "architectures": [
+    "LlamaForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "freeze_mm_mlp_adapter": false,
+  "hidden_act": "silu",
+  "hidden_size": 5120,
+  "image_aspect_ratio": "square",
+  "initializer_range": 0.02,
+  "intermediate_size": 13824,
+  "max_length": 4096,
+  "max_position_embeddings": 4096,
+  "mm_hidden_size": 1024,
+  "mm_patch_merge_type": "flat",
+  "mm_projector_lr": null,
+  "mm_projector_type": "mlp2x_gelu",
+  "mm_use_im_patch_token": false,
+  "mm_use_im_start_end": false,
+  "mm_vision_select_feature": "patch",
+  "mm_vision_select_layer": -2,
+  "mm_vision_tower": "openai/clip-vit-large-patch14-336",
+  "model_type": "llava_llama",
+  "num_attention_heads": 40,
+  "num_hidden_layers": 40,
+  "num_key_value_heads": 40,
+  "pad_token_id": 0,
+  "pretraining_tp": 1,
+  "rms_norm_eps": 1e-05,
+  "rope_scaling": null,
+  "rope_theta": 10000.0,
+  "tie_word_embeddings": false,
+  "tokenizer_model_max_length": 2048,
+  "tokenizer_padding_side": "right",
+  "torch_dtype": "float16",
+  "transformers_version": "4.37.2",
+  "tune_mm_mlp_adapter": true,
+  "use_cache": false,
+  "use_mm_proj": true,
+  "vocab_size": 32000
+}'''
+
+
+
 from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
-
+import code
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder import build_vision_projector
+from .multimodal_projector.builder import build_vision_projector, build_geometry_projector
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
@@ -34,6 +83,7 @@ class LlavaMetaModel:
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
+            self.p2g_projector = build_geometry_projector(config)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -51,6 +101,7 @@ class LlavaMetaModel:
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        pretrain_p2g_mlp_adapter = model_args.pretrain_p2g_mlp_adapter 
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
@@ -70,15 +121,21 @@ class LlavaMetaModel:
             vision_tower.load_model()
 
         self.config.use_mm_proj = True
+        self.config.use_p2g_proj = model_args.use_p2g_projector
+
         self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        if self.config.use_p2g_proj:
+            self.config.p2g_projector_type = getattr(model_args, 'p2g_projector_type', 'linear')
+        
+        # 1024 is the default hidden size for the vision tower
         self.config.mm_hidden_size = vision_tower.hidden_size
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
+        # defualt merge type: flat the image features
         self.config.mm_patch_merge_type = mm_patch_merge_type
-
+        
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
-
             if 'unpad' in mm_patch_merge_type:
                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
                 self.image_newline = nn.Parameter(
@@ -89,12 +146,28 @@ class LlavaMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
+
+        if (self.config.use_p2g_proj) and (getattr(self, 'p2g_projector', None) is None):
+            self.p2g_projector = build_vision_projector(self.config)
+        # else:
+        #     # In case it is frozen by LoRA
+        #     for p in self.p2g_projector.parameters():
+        #         p.requires_grad = True
+
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+        
+
+        if pretrain_p2g_mlp_adapter is not None:
+            p2g_projector_weights = torch.load(pretrain_p2g_mlp_adapter, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+            self.p2g_projector.load_state_dict(get_w(p2g_projector_weights, 'p2g_projector'))
 
 
 def unpad_image(tensor, original_size):
@@ -139,13 +212,22 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
+        projected_image_features = self.get_model().mm_projector(image_features)
+        
+        if self.config.use_p2g_proj:
+            geometric_features = self.get_model().p2g_projector(image_features)
+            return projected_image_features, geometric_features
+
+        return projected_image_features, None
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
     ):
+        #TBD: check the images shape, is it batch images or single image? what is the shape.channle of the image?
+        # images.shape: [32, 3, 336, 336])
+
+
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
@@ -154,7 +236,7 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            image_features, geometric_features = self.encode_images(concat_images)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -199,7 +281,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            image_features, geometric_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -229,8 +311,13 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
+        #TBD: how does cur_input_ids created???
         for batch_idx, cur_input_ids in enumerate(input_ids):
+            #(cur_input_ids == IMAGE_TOKEN_INDEX) to check if the current token is image token
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            
+            # specify deal with the no image tokens case:
+                # basiclly do nothing but keep same dims, the cur_image_features[0:0] slice will lead a same shape tensor with 0 dims 
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
@@ -239,20 +326,25 @@ class LlavaMetaForCausalLM(ABC):
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
-
+            
+            # find all image token indices and add sequence length to the end, e.g. image toekn indices: [-200, 0, 3, 5, 7], then image token indices: [-1, 0, cur_input_ids.shape[0]]
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
             cur_labels_noim = []
+            # use image token indices to split the input_ids and labels into no image tokens and image tokens -1 is usefual, note that [i]+1 differs [i+1] 
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
+            
+            # record that textual token length and embed them
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
 
+            # use original order to concat the no textual tokens and image tokens
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
@@ -321,6 +413,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
+        # code.interact(local=dict(globals(),**locals()))
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

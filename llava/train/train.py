@@ -14,6 +14,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+# ModelArguments(model_name_or_path='lmsys/vicuna-13b-v1.5', version='plain', freeze_backbone=False, tune_mm_mlp_adapter=True, tune_p2g_mlp_adapter=False, vision_tower='openai/clip-vit-large-patch14-336', mm_vision_select_layer=-2, pretrain_mm_mlp_adapter=None, pretrain_p2g_mlp_adapter=None, mm_projector_type='mlp2x_gelu', p2g_projector_type='linear', use_p2g_projector=False, mm_use_im_start_end=False, mm_use_im_patch_token=False, mm_patch_merge_type='flat', mm_vision_select_feature='patch')
+
 import os
 import copy
 from dataclasses import dataclass, field
@@ -36,7 +38,7 @@ from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
-
+import code
 
 local_rank = None
 
@@ -56,10 +58,14 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    tune_p2g_mlp_adapter: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    pretrain_p2g_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
+    p2g_projector_type: Optional[str] = field(default='linear')
+    use_p2g_projector: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
@@ -788,12 +794,15 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 def train(attn_implementation=None):
     global local_rank
 
+    #parse arguments
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    print(model_args)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    #train model in bits 4/8
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -813,7 +822,9 @@ def train(attn_implementation=None):
             )
         ))
 
+    #init model in 3 situations; 
     if model_args.vision_tower is not None:
+        # 1. multimodal model
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
@@ -823,6 +834,7 @@ def train(attn_implementation=None):
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
+        # 2. noraml model
         else:
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -831,6 +843,7 @@ def train(attn_implementation=None):
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
+        # 3. others(LLM model only)
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -840,7 +853,8 @@ def train(attn_implementation=None):
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
-
+    
+    # default is false; meaning will not freeze the backbone
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -849,6 +863,7 @@ def train(attn_implementation=None):
         model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
+    # TBD：not understand what is this code for
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -857,6 +872,7 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+    # use lora to reduce the model training params
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -907,6 +923,7 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+    # init vision model and fsdp means Fully Sharded Data Parallel to store prams in different GPUs
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -923,6 +940,7 @@ def train(attn_implementation=None):
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
+        # control projector frozon or not
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
@@ -934,6 +952,16 @@ def train(attn_implementation=None):
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
+
+        # new adding mlp
+        model.config.tune_p2g_mlp_adapter = training_args.tune_p2g_mlp_adapter = model_args.tune_p2g_mlp_adapter
+        if model_args.tune_p2g_mlp_adapter:
+            model.requires_grad_(False)
+            for p in model.get_model().p2g_projector.parameters():
+                p.requires_grad = True
+        ############################################################################################################
+
+
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -942,10 +970,6 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-    # print("**************")
-    # print(model_args.vision_tower)
-    # print(model.get_model().mm_projector)
-    # exit()
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -966,6 +990,9 @@ def train(attn_implementation=None):
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+
+    code.interact(local=dict(globals(),**locals()))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
